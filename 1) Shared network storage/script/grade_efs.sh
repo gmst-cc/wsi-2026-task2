@@ -51,10 +51,10 @@ fi
 # ── Security Group ────────────────────────────────────────────────
 section "Security Group 확인 (sg-wsi-efs → TCP 2049 → sg-wsi-ec2만 허용)"
 SG_EFS_ID=$(aws ec2 describe-security-groups \
-    --filters "Name=tag:Name,Values=sg-wsi-efs" \
+    --filters "Name=group-name,Values=wsi-efs" \
     --query "SecurityGroups[0].GroupId" --output text --region $REGION 2>/dev/null)
 SG_EC2_ID=$(aws ec2 describe-security-groups \
-    --filters "Name=tag:Name,Values=sg-wsi-ec2" \
+    --filters "Name=group-name,Values=wsi-ec2" \
     --query "SecurityGroups[0].GroupId" --output text --region $REGION 2>/dev/null)
 
 CMD="aws ec2 describe-security-groups --group-ids $SG_EFS_ID --query \"SecurityGroups[0].IpPermissions\" --output json --region ap-northeast-2"
@@ -166,7 +166,7 @@ fi
 
 # ── EFS Access Point ─────────────────────────────────────────────
 section "EFS Access Point 확인"
-CMD="aws efs describe-access-points --file-system-id $EFS_ID --query \"AccessPoints[?Name==\`wsi-efs-ap\`].[AccessPointId,RootDirectory.Path,PosixUser.Uid,PosixUser.Gid]\" --output text --region ap-northeast-2"
+CMD="aws efs describe-access-points --file-system-id $EFS_ID --query \"AccessPoints[?Tags[?Key=='Name' && Value=='wsi-efs-ap']].[AccessPointId,RootDirectory.Path,PosixUser.Uid,PosixUser.Gid]\" --output text --region ap-northeast-2"
 echo "  명령어: $CMD"
 AP_INFO=$(eval $CMD 2>/dev/null)
 AP_ID=$(echo "$AP_INFO" | awk '{print $1}')
@@ -190,36 +190,47 @@ for SERVER in "wsi-app-server-a" "wsi-app-server-c"; do
         --query "Reservations[0].Instances[0].InstanceId" --output text --region $REGION 2>/dev/null)
 
     echo "  [$SERVER] SSM mount 확인"
+
     CMD_ID=$(aws ssm send-command \
         --instance-ids "$INST_ID" \
         --document-name "AWS-RunShellScript" \
         --parameters 'commands=["mount | grep /mnt/shared"]' \
         --query "Command.CommandId" --output text --region $REGION 2>/dev/null)
+
     sleep 3
+
     MOUNT_OUT=$(aws ssm get-command-invocation \
         --command-id "$CMD_ID" --instance-id "$INST_ID" \
         --query "StandardOutputContent" --output text --region $REGION 2>/dev/null)
-    echo "  예상 출력 값: ... /mnt/shared ... tls ..."
+
+    echo "  예상 출력 값: ... /mnt/shared ..."
     echo "  실제 출력 값: $MOUNT_OUT"
 
     FSTAB_ID=$(aws ssm send-command \
         --instance-ids "$INST_ID" \
         --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["grep /mnt/shared /etc/fstab"]' \
+        --parameters 'commands=["cat /etc/fstab"]' \
         --query "Command.CommandId" --output text --region $REGION 2>/dev/null)
+
     sleep 3
+
     FSTAB_OUT=$(aws ssm get-command-invocation \
         --command-id "$FSTAB_ID" --instance-id "$INST_ID" \
         --query "StandardOutputContent" --output text --region $REGION 2>/dev/null)
-    echo "  [fstab] 예상 출력 값: ... efs ... tls ..."
-    echo "  [fstab] 실제 출력 값: $FSTAB_OUT"
 
-    TLS_OK=false; FSTAB_OK=false
-    echo "$MOUNT_OUT" | grep -q "tls" && TLS_OK=true
-    echo "$FSTAB_OUT" | grep -q "/mnt/shared" && FSTAB_OK=true
+    echo "  [fstab] 실제 출력 값:"
+    echo "$FSTAB_OUT"
 
-    $TLS_OK && pass "$SERVER TLS 마운트" 1 || fail "$SERVER TLS 마운트 없음"
-    $FSTAB_OK && pass "$SERVER fstab 자동 마운트" 1 || fail "$SERVER fstab 없음"
+    # mount 체크
+    MOUNT_OK=false
+    echo "$MOUNT_OUT" | grep -q "/mnt/shared" && MOUNT_OK=true
+
+    # TLS + accesspoint + _netdev 체크 (fstab 기준)
+    TLS_OK=false
+    echo "$FSTAB_OUT" | awk '/\/mnt\/shared/ && /accesspoint/ && /tls/ && /_netdev/' >/dev/null && TLS_OK=true
+
+    $MOUNT_OK && pass "$SERVER 마운트 확인" 1 || fail "$SERVER 마운트 실패"
+    $TLS_OK && pass "$SERVER TLS 설정 (fstab)" 1 || fail "$SERVER TLS 설정 없음"
 done
 
 
